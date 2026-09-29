@@ -143,24 +143,22 @@ def _read_key(fd: int) -> str:
 
 
 def choose(title: str, options: list[str]) -> int:
-    """Show a numbered, arrow-key navigable menu and return a zero-based choice."""
+    """Show a letter-key and arrow-key navigable menu."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise PVEError("交互菜单需要在终端中运行，请直接执行：python3 pve_manager.py")
 
     fd = sys.stdin.fileno()
     previous = termios.tcgetattr(fd)
     selected = 0
-    number_buffer = ""
     try:
         tty.setraw(fd)
         while True:
             sys.stdout.write("\x1b[2J\x1b[H")
-            sys.stdout.write(f"{title}\n使用 ↑/↓ 或输入编号，回车确认\n\n")
+            sys.stdout.write(f"{title}\r\n使用 ↑/↓ 移动，按字母选择，回车确认\r\n\r\n")
             for index, option in enumerate(options):
                 marker = ">" if index == selected else " "
-                sys.stdout.write(f"{marker} {index + 1}. {option}\n")
-            if number_buffer:
-                sys.stdout.write(f"\n编号：{number_buffer}")
+                letter = chr(ord("A") + index)
+                sys.stdout.write(f"{marker} [{letter}] {option}\r\n")
             sys.stdout.flush()
 
             key = _read_key(fd)
@@ -168,24 +166,67 @@ def choose(title: str, options: list[str]) -> int:
                 raise KeyboardInterrupt
             if key == "up":
                 selected = (selected - 1) % len(options)
-                number_buffer = ""
             elif key == "down":
                 selected = (selected + 1) % len(options)
-                number_buffer = ""
             elif key in ("\r", "\n"):
-                if number_buffer:
-                    index = int(number_buffer) - 1
-                    if 0 <= index < len(options):
-                        return index
+                return selected
+            elif key.isalpha():
+                index = ord(key.lower()) - ord("a")
+                if 0 <= index < len(options):
+                    return index
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+
+
+def choose_vm_or_command(machines: list[VirtualMachine]) -> int | str:
+    """Display VMs separately from letter-keyed main-menu commands."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise PVEError("交互菜单需要在终端中运行，请直接执行：python3 pve_manager.py")
+
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    selected = 0
+    vmid_buffer = ""
+    commands = {"a": "start_all", "s": "shutdown_all", "r": "refresh", "q": "quit"}
+    try:
+        tty.setraw(fd)
+        while True:
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.write("Proxmox VE 虚拟机管理\r\n")
+            sys.stdout.write("虚拟机列表（↑/↓选择，回车进入，也可输入 VMID）\r\n\r\n")
+            for index, machine in enumerate(machines):
+                marker = ">" if index == selected else " "
+                sys.stdout.write(f"{marker} {machine.label}\r\n")
+            sys.stdout.write("\r\n操作\r\n")
+            sys.stdout.write("  [A] 全部开机    [S] 全部关机\r\n")
+            sys.stdout.write("  [R] 刷新列表    [Q] 退出\r\n")
+            if vmid_buffer:
+                sys.stdout.write(f"\r\nVMID：{vmid_buffer}")
+            sys.stdout.flush()
+
+            key = _read_key(fd)
+            if key == "\x03":
+                raise KeyboardInterrupt
+            if key == "up":
+                selected = (selected - 1) % len(machines)
+                vmid_buffer = ""
+            elif key == "down":
+                selected = (selected + 1) % len(machines)
+                vmid_buffer = ""
+            elif key in ("\r", "\n"):
+                if vmid_buffer:
+                    for index, machine in enumerate(machines):
+                        if str(machine.vmid) == vmid_buffer:
+                            return index
+                    vmid_buffer = ""
                 else:
                     return selected
-                number_buffer = ""
-            elif key in ("\x7f", "\b"):
-                number_buffer = number_buffer[:-1]
             elif key.isdigit():
-                number_buffer += key
-            elif key == "escape":
-                number_buffer = ""
+                vmid_buffer += key
+            elif key in ("\x7f", "\b"):
+                vmid_buffer = vmid_buffer[:-1]
+            elif key.lower() in commands:
+                return commands[key.lower()]
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
@@ -221,6 +262,41 @@ def confirm_shutdown(machine: VirtualMachine) -> bool:
     return choose(f"确认关闭虚拟机 {machine.name} (VMID {machine.vmid})？", ["确认关机", "取消"]) == 0
 
 
+def bulk_power(client: PVEClient, machines: list[VirtualMachine], action: str) -> None:
+    if action == "start":
+        action_name = "开机"
+        targets = [machine for machine in machines if machine.status != "running"]
+        operate = client.power_on
+    else:
+        action_name = "关闭"
+        targets = [machine for machine in machines if machine.status == "running"]
+        operate = client.shutdown
+
+    if not targets:
+        print(f"没有需要{action_name}的虚拟机。")
+        wait_for_enter()
+        return
+
+    submitted: list[tuple[VirtualMachine, object]] = []
+    failed: list[tuple[VirtualMachine, PVEError]] = []
+    for machine in targets:
+        try:
+            submitted.append((machine, operate(machine)))
+        except PVEError as error:
+            failed.append((machine, error))
+
+    print(f"批量{action_name}请求：已提交 {len(submitted)} 台，失败 {len(failed)} 台。")
+    for machine, task in submitted:
+        print(f"已提交 {machine.name} (VMID {machine.vmid})：{task or 'PVE 已接受请求'}")
+    for machine, error in failed:
+        print(f"操作失败 {machine.name} (VMID {machine.vmid})：{error}")
+    wait_for_enter()
+
+
+def confirm_bulk_shutdown(count: int) -> bool:
+    return choose(f"确认关闭全部 {count} 台运行中的虚拟机/容器？", ["确认全部关机", "取消"]) == 0
+
+
 def run() -> None:
     client = PVEClient(load_config())
     while True:
@@ -236,11 +312,20 @@ def run() -> None:
             wait_for_enter()
             return
 
-        options = [machine.label for machine in machines] + ["刷新列表", "退出"]
-        choice = choose("Proxmox VE 虚拟机管理", options)
-        if choice == len(machines):
+        choice = choose_vm_or_command(machines)
+        if choice == "start_all":
+            bulk_power(client, machines, "start")
             continue
-        if choice == len(machines) + 1:
+        if choice == "shutdown_all":
+            running_count = sum(machine.status == "running" for machine in machines)
+            if not running_count:
+                bulk_power(client, machines, "shutdown")
+            elif confirm_bulk_shutdown(running_count):
+                bulk_power(client, machines, "shutdown")
+            continue
+        if choice == "refresh":
+            continue
+        if choice == "quit":
             return
         manage_vm(client, machines[choice])
 
